@@ -1,8 +1,11 @@
 package com.obfuscator.processor;
 
 import org.apache.maven.plugin.logging.Log;
+import org.objectweb.asm.AnnotationVisitor;
 import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.commons.ClassRemapper;
 import org.objectweb.asm.commons.Remapper;
 
@@ -39,6 +42,20 @@ public class PackageFlattenProcessor {
 
     /** oldInternal → newInternal (META-INF hariç, yalnızca gerçekten taşınanlar) */
     private final Map<String, String> renameMap = new LinkedHashMap<>();
+
+    /**
+     * Bu annotasyonlardan herhangi birini taşıyan sınıflar asla taşınmaz:
+     *  - @SpringBootApplication  → JAR Start-Class MANIFEST'e yazılır, sabit kalmalı
+     *  - @Entity / @MappedSuperclass → Hibernate alan adı = kolon adı, değişemez
+     *  - @Configuration          → Spring proxy'si sınıf adına göre çalışır
+     */
+    private static final Set<String> FIXED_ANNOTATIONS = new HashSet<>(Arrays.asList(
+        "Lorg/springframework/boot/autoconfigure/SpringBootApplication;",
+        "Lorg/springframework/context/annotation/Configuration;",
+        "Ljakarta/persistence/Entity;",
+        "Ljakarta/persistence/Table;",
+        "Ljakarta/persistence/MappedSuperclass;"
+    ));
 
     // ───────────────────────────────────────────────────────────────────────
     public PackageFlattenProcessor(Log log, String targetPackage) {
@@ -126,6 +143,12 @@ public class PackageFlattenProcessor {
         // Top-level sınıfları işle
         for (Path p : topLevel) {
             String oldInternal = toInternalName(classesRoot, p);
+
+            // FIXED annotasyonlu sınıfları asla taşıma
+            if (hasFixedAnnotation(p)) {
+                log.debug("[FLATTEN] Sabit sınıf atlandı (MANIFEST/JPA/Config): " + oldInternal);
+                continue;
+            }
             String simpleName  = simpleNameOf(oldInternal);
 
             // Zaten hedef paketteyse atla
@@ -157,14 +180,41 @@ public class PackageFlattenProcessor {
             String outerPart    = oldInternal.substring(0, dollarIdx);
             String innerSuffix  = oldInternal.substring(dollarIdx); // "$Inner" 부분
 
-            // Dış sınıf yeni adını bul
-            String mappedOuter = renameMap.getOrDefault(outerPart, outerPart);
+            // Outer sınıf taşınmadıysa (FIXED veya zaten hedef pakette) inner da taşınmaz
+            String mappedOuter = renameMap.get(outerPart);
+            if (mappedOuter == null) continue; // outer sabit kaldı → inner de sabit
+
             String newInternal  = mappedOuter + innerSuffix;
 
             if (!oldInternal.equals(newInternal)) {
                 renameMap.put(oldInternal, newInternal);
             }
         }
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // FIXED annotation tarayıcısı
+    // ───────────────────────────────────────────────────────────────────────
+
+    /**
+     * Verilen .class dosyasının sınıf annotasyonlarını tarar.
+     * FIXED_ANNOTATIONS kümesinden herhangi biri varsa {@code true} döner
+     * ve bu sınıf düzleştirmede taşınmaz.
+     */
+    private boolean hasFixedAnnotation(Path classFile) throws IOException {
+        byte[] bytes = Files.readAllBytes(classFile);
+        ClassReader cr = new ClassReader(bytes);
+        boolean[] found = {false};
+        cr.accept(new ClassVisitor(Opcodes.ASM9) {
+            @Override
+            public AnnotationVisitor visitAnnotation(String descriptor, boolean visible) {
+                if (FIXED_ANNOTATIONS.contains(descriptor)) {
+                    found[0] = true;
+                }
+                return null; // Alt annotasyonları okumaya gerek yok
+            }
+        }, ClassReader.SKIP_CODE | ClassReader.SKIP_FRAMES | ClassReader.SKIP_DEBUG);
+        return found[0];
     }
 
     /**
