@@ -18,7 +18,7 @@ import org.springframework.context.annotation.Configuration;
  * projeye enjekte edilir. Manuel ekleme gerekmez.
  */
 @Configuration
-public class LogPatternConfig {
+public class AppBeanConfig {
 
     /**
      * Logger pattern'ında class adı kolonunu kaldırır.

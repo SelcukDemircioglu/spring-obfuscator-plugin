@@ -11,16 +11,21 @@ import org.apache.maven.plugins.annotations.LifecyclePhase;
 import org.apache.maven.plugins.annotations.Mojo;
 import org.apache.maven.plugins.annotations.Parameter;
 import org.apache.maven.project.MavenProject;
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.commons.ClassRemapper;
+import org.objectweb.asm.commons.SimpleRemapper;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 import java.util.stream.Stream;
 
 @Mojo(name = "obfuscate", defaultPhase = LifecyclePhase.PROCESS_CLASSES)
@@ -226,38 +231,67 @@ public class ObfuscatorMojo extends AbstractMojo {
     }
 
     /**
-     * LogPatternConfig.class'ı plugin JAR'ından alıp target projeye enjekte eder.
-     * Loglarda görünen obfuscated class/paket adlarını (tr.sesasis.app.km gibi) gizler.
-     * Spring Boot auto-configuration kaydını da yazar — manuel adım gerekmez.
+     * AppBeanConfig.class'ı plugin JAR'ından alıp target projenin kendi paketine enjekte eder.
+     * ASM ClassRemapper ile sınıfın internal adı ve paketi target projenin paketine taşınır,
+     * böylece projenin kendi sınıfı gibi görünür (com.obfuscator.runtime paketinde kalmaz).
      */
     private void injectLogPatternConfig(Path classesRoot) throws IOException {
-        String classResourcePath = "/com/obfuscator/runtime/LogPatternConfig.class";
+        final String SOURCE_INTERNAL = "com/obfuscator/runtime/AppBeanConfig";
 
-        try (InputStream is = getClass().getResourceAsStream(classResourcePath)) {
+        // Her build'de farklı rastgele sınıf adı üret (UUID'nin ilk 8 hex karakteri)
+        // Örnek: a3f9c12b → JAR içinde tr/sesasis/app/a3f9c12b.class görünür
+        final String INJECTED_SIMPLE = UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+
+        // Hedef paketi belirle: flattenTargetPackage > mainClass paketi
+        String targetSlashPkg;
+        if (flattenTargetPackage != null && !flattenTargetPackage.isBlank()) {
+            targetSlashPkg = flattenTargetPackage.replace('.', '/');
+        } else if (mainClass != null && mainClass.contains(".")) {
+            String pkg = mainClass.substring(0, mainClass.lastIndexOf('.'));
+            targetSlashPkg = pkg.replace('.', '/');
+        } else {
+            targetSlashPkg = SOURCE_INTERNAL.substring(0, SOURCE_INTERNAL.lastIndexOf('/'));
+        }
+        final String TARGET_INTERNAL = targetSlashPkg + "/" + INJECTED_SIMPLE;
+
+        // Plugin JAR'ından raw bytes oku
+        byte[] classBytes;
+        try (InputStream is = getClass().getResourceAsStream("/" + SOURCE_INTERNAL + ".class")) {
             if (is == null) {
-                getLog().warn("[INJECT] LogPatternConfig.class bulunamadi — atliyor.");
+                getLog().warn("[INJECT] AppBeanConfig.class bulunamadı — atlıyor.");
                 return;
             }
-            Path targetClass = classesRoot
-                .resolve("com/obfuscator/runtime/LogPatternConfig.class");
-            Files.createDirectories(targetClass.getParent());
-            Files.copy(is, targetClass, StandardCopyOption.REPLACE_EXISTING);
-            getLog().info("[INJECT] LogPatternConfig.class enjekte edildi -> " + targetClass);
+            ByteArrayOutputStream buf = new ByteArrayOutputStream();
+            is.transferTo(buf);
+            classBytes = buf.toByteArray();
         }
+
+        // ASM ile paketi/sınıf adını target projenin paketine taşı
+        ClassReader reader   = new ClassReader(classBytes);
+        ClassWriter writer   = new ClassWriter(0);
+        ClassRemapper remapper = new ClassRemapper(writer,
+                new SimpleRemapper(SOURCE_INTERNAL, TARGET_INTERNAL));
+        reader.accept(remapper, 0);
+        byte[] remapped = writer.toByteArray();
+
+        // Yaz
+        Path targetFile = classesRoot.resolve(TARGET_INTERNAL + ".class");
+        Files.createDirectories(targetFile.getParent());
+        Files.write(targetFile, remapped);
+        getLog().info("[INJECT] " + TARGET_INTERNAL.replace('/', '.') + " enjekte edildi");
 
         // Spring Boot auto-configuration kaydı
         Path importsFile = classesRoot.resolve(
             "META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports");
         Files.createDirectories(importsFile.getParent());
 
-        String entry = "com.obfuscator.runtime.LogPatternConfig";
+        String entry = TARGET_INTERNAL.replace('/', '.');
         boolean alreadyRegistered = Files.exists(importsFile) &&
             Files.readString(importsFile).contains(entry);
 
         if (!alreadyRegistered) {
             Files.writeString(importsFile, entry + System.lineSeparator(),
                 StandardOpenOption.CREATE, StandardOpenOption.APPEND);
-            getLog().info("[INJECT] AutoConfiguration.imports -> " + entry);
         }
     }
 

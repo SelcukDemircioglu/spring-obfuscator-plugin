@@ -86,12 +86,22 @@ public class Level1BasicObfuscator {
 
                     @Override
                     public void visitFieldInsn(int opcode, String owner, String name, String descriptor) {
-                        // Remap GETFIELD/PUTFIELD references for fields declared in this class
-                        if (owner.equals(className)) {
-                            String mapped = nameGenerator.getMappedName(className + "." + name);
-                            if (mapped != null) {
-                                name = mapped;
-                            }
+                        // Remap GETFIELD/PUTFIELD references.
+                        //
+                        // Case 1: field declared in this class → key = className + "." + name
+                        // Case 2: field declared in a private inner class (e.g. private record)
+                        //         accessed from the outer class. Java compiler generates direct
+                        //         GETFIELD (not accessor call) for same-compilation-unit access.
+                        //         owner = "OuterClass$InnerRecord", key = owner + "." + name.
+                        //
+                        // getMappedName() returns null when no mapping exists, so this is safe
+                        // for all external class references — only registered renames get applied.
+                        String lookupKey = owner.equals(className)
+                                ? className + "." + name   // fast path: same class
+                                : owner + "." + name;      // inner/other class field
+                        String mapped = nameGenerator.getMappedName(lookupKey);
+                        if (mapped != null) {
+                            name = mapped;
                         }
                         super.visitFieldInsn(opcode, owner, name, descriptor);
                     }
