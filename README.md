@@ -196,18 +196,34 @@ mvn clean package -P obfuscate
   <!-- Paket düzleştirme -->
   <flattenPackages>true</flattenPackages>
   <flattenTargetPackage>tr.sesasis.app</flattenTargetPackage>
+
+  <!-- TAM KORUMA: dosya adları da anlamsızlaştır (a.class, b.class, ba.class, …) -->
+  <flattenObfuscateNames>${obfuscation.flattenObfuscateNames}</flattenObfuscateNames>
 </configuration>
 ```
 
 **Nasıl Çalışır:**
 
+0. Önceki flatten çalışmasından kalan eski `.class` dosyaları hedef paketten temizlenir (**Phase 0**)
+   → `mvn clean` kullanılmadan yapılan ardardına derlemelerde `NoSuchMethodError`'a yol açan
+     isim çakışmaları bu aşama ile önlenir
 1. Tüm `.class` dosyaları için `old → new` ad eşlemesi oluşturulur
+   - `flattenObfuscateNames=true` ise: her sınıf `a`, `b`, …, `z`, `aa`, `ab`, … sırasıyla adlandırılır
+   - `flattenObfuscateNames=false` ise: orijinal basit ad korunur, çakışmada sayısal son ek eklenir
 2. ASM `ClassRemapper` ile her `.class` içindeki tüm referanslar güncellenir
 3. Dosyalar hedef pakete taşınır
 4. Boş dizinler temizlenir
-5. İç sınıflar (`Outer$Inner`) dış sınıfıyla birlikte tutulur
-6. Ad çakışması olursa `MyClass1`, `MyClass2`, … şeklinde son ek eklenir
-7. `META-INF/` hiçbir zaman değiştirilmez
+5. İç sınıflar (`Outer$Inner`) dış sınıfla birlikte tutulur — `Outer` sabit kalmışsa `Inner` da sabit kalır
+6. `META-INF/` hiçbir zaman değiştirilmez
+
+**Sabit Kalan Sınıflar (asla taşınmaz):**
+
+| Kriter | Neden |
+|--------|-------|
+| `ACC_ENUM` bayrağı | `@Query` JPQL string literal'ları enum FQDN içerir; ASM `String` içeriklerini güncellemez |
+| `@SpringBootApplication` | JAR `MANIFEST.MF Start-Class` sabit kalmalı |
+| `@Configuration` | Spring proxy'si sınıf adına göre çalışır |
+| `@Entity` / `@Table` / `@MappedSuperclass` | Hibernate alan adı = kolon adı; değişemez |
 
 **Parametreler:**
 
@@ -215,7 +231,35 @@ mvn clean package -P obfuscate
 |-----------|-----|------------|----------|
 | `flattenPackages` | `boolean` | `false` | Etkinleştir/devre dışı bırak |
 | `flattenTargetPackage` | `String` | `""` (kök paket) | Hedef paket (nokta notasyonu) |
+| `flattenObfuscateNames` | `boolean` | `false` | Sınıf adlarını da anlamsızlaştır |
 
+### flattenObfuscateNames — Sınıf Adı Obfuscation
+
+`flattenObfuscateNames=true` ile taşınan sınıflar anlamsız kısa adlar alır:
+
+```
+tr/sesasis/kara/service/ContentCategoryService.class  →  tr/sesasis/app/a.class
+tr/sesasis/kara/dto/ContentCategoryDto.class          →  tr/sesasis/app/b.class
+tr/sesasis/core/domain/BaseDTO.class                  →  tr/sesasis/app/c.class
+tr/sesasis/tren/service/TripService.class             →  tr/sesasis/app/ba.class
+...
+```
+
+`pom.xml`'de property olarak tanımlayın; build sırasında `-D` ile ezin:
+
+```xml
+<properties>
+  <obfuscation.flattenObfuscateNames>true</obfuscation.flattenObfuscateNames>
+</properties>
+```
+
+```bash
+# Sınıf adı obfuscation'ı geçici olarak kapat
+mvn package -P spring-obfuscate -Dobfuscation.flattenObfuscateNames=false
+
+# Tam koruma
+mvn package -P spring-obfuscate -Dobfuscation.flattenObfuscateNames=true
+```
 ---
 
 ## LEVEL_4 — AES-256-GCM Sınıf Şifreleme
@@ -284,6 +328,7 @@ mvn package -P obfuscate -Dobfuscation.encryptionKey=<64-char-hex>
 | `excludePackages` | `String[]` | — | İşlem dışı tutulacak paket adları |
 | `flattenPackages` | `boolean` | `false` | Paket düzleştirmeyi etkinleştir |
 | `flattenTargetPackage` | `String` | `""` | Düzleştirme hedef paketi |
+| `flattenObfuscateNames` | `boolean` | `false` | Düzleştirilen sınıfların adlarını da anlamsızlaştır (`a`, `b`, `aa`, …) |
 | `mainClass` | `String` | — | (LEVEL_4) Gerçek Spring Boot main class |
 | `encryptionKey` | `String` | — | (LEVEL_4) 64-char hex AES-256 anahtarı; boşsa rastgele üretilir |
 
@@ -330,8 +375,8 @@ Varsayılan değerleri `<properties>` bloğuna ekleyin:
   <!-- LEVEL_4_ENCRYPTED: Docker/CI; LEVEL_3_ADVANCED: lokal -->
   <obfuscation.level>LEVEL_3_ADVANCED</obfuscation.level>
   <!-- LEVEL_4'te com.obfuscator.runtime.EncryptedLauncher olarak override edilir -->
-  <obfuscation.startClass>com.example.MyApplication</obfuscation.startClass>
-</properties>
+  <obfuscation.startClass>com.example.MyApplication</obfuscation.startClass>  <!-- Flatten sırasında sınıf adları da anlamsızlaşsın mı? -Dobfuscation.flattenObfuscateNames=false ile kapatılabilir -->
+  <obfuscation.flattenObfuscateNames>true</obfuscation.flattenObfuscateNames></properties>
 ```
 
 ### Üretim — LEVEL_4 + Paket Düzleştirme
@@ -469,6 +514,23 @@ java -cp target/myapp.jar com.obfuscator.runtime.EncryptedLauncher
 **Hangi sınıflar şifrelenmez (LEVEL_4)?**
 
 `@Entity`, `@Table`, `@MappedSuperclass`, `@Configuration`, `@Bean`, `@SpringBootApplication` annotasyonlu sınıflar **FULL** korumalıdır; şifrelenmez, yeniden adlandırılmaz. Spring/JPA/Hibernate bunları yansıma ile yükleyeceği için isimlerinin sabit kalması zorunludur.
+
+---
+
+**`flattenObfuscateNames` aktifken decompiler klasik sınıf adlarını görebilir mi?**
+
+Hayır. `flattenObfuscateNames=true` olduğunda her taşınan sınıf `a.class`, `b.class`, `ba.class`, … şekilde yeniden adlandırılır. Tüm bytecode referansları (field descriptor, method signature, `CONSTANT_Class`, inner class attribute) ASM `ClassRemapper` ile güncellendiğinden JVM hatasız çalışır; decompiler ise anlamsız kısa adlar görür.
+
+> **macOS notu:** İsim üreteci yalnızca küçük harf kullanır (`a`–`z`, `aa`–`az`, `ba`…). Büyük+küçük karışım (`A` ve `a`) macOS HFS+ dosya sisteminde aynı dosyaya yazılır ve `ClassNotFoundException`’a yol açar.
+
+---
+
+**`mvn clean` kullanmadan build aldım, `NoSuchMethodError` görüdüm.**
+
+Plugin’in **Phase 0** (stale-class temizleme) aşaması bu durumu otomatik önler: flatten başlamadan önce hedef paketteki eski `.class` dosyaları silinir. Log’da şu satırı görürsen Phase 0 devreye girmiş demektir:
+```
+[INFO] [FLATTEN] Onceki flatten calismasinden 421 eski sinif hedef paketten temizlendi.
+```
 
 ---
 

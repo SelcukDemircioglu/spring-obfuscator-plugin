@@ -14,8 +14,11 @@ import org.apache.maven.project.MavenProject;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Stream;
@@ -76,6 +79,15 @@ public class ObfuscatorMojo extends AbstractMojo {
     @Parameter(property = "obfuscation.flattenTargetPackage", defaultValue = "")
     private String flattenTargetPackage;
 
+    /**
+     * Düzleştirilen sınıfların dosya adları da anlamsızlaştırılsın mı?
+     * true ise her taşınan sınıf a, b, c, … şeklinde kısa isim alır.
+     * false (default) ise orijinal basit ad korunur.
+     * {@link #flattenPackages} = true olduğunda geçerlidir.
+     */
+    @Parameter(property = "obfuscation.flattenObfuscateNames", defaultValue = "false")
+    private boolean flattenObfuscateNames;
+
     @Override
     public void execute() throws MojoExecutionException {
         if (!enabled) {
@@ -92,6 +104,7 @@ public class ObfuscatorMojo extends AbstractMojo {
         getLog().info("Paket duzlestirme  : " + (flattenPackages ? "Aktif → " +
             (flattenTargetPackage == null || flattenTargetPackage.isBlank()
                 ? "(kok paket)" : flattenTargetPackage)
+                + (flattenObfuscateNames ? " [isim obfuscation AKTIF]" : "")
             : "Devre disi"));
 
         if (level == ObfuscationLevel.LEVEL_4_ENCRYPTED) {
@@ -121,6 +134,7 @@ public class ObfuscatorMojo extends AbstractMojo {
         config.setMainClass(mainClass);
         config.setFlattenPackages(flattenPackages);
         config.setFlattenTargetPackage(flattenTargetPackage);
+        config.setFlattenObfuscateNames(flattenObfuscateNames);
 
         ClassProcessor processor = new ClassProcessor(config, getLog());
 
@@ -136,11 +150,14 @@ public class ObfuscatorMojo extends AbstractMojo {
             if (flattenPackages) {
                 getLog().info("");
                 PackageFlattenProcessor flattener =
-                    new PackageFlattenProcessor(getLog(), flattenTargetPackage);
+                    new PackageFlattenProcessor(getLog(), flattenTargetPackage, flattenObfuscateNames);
                 flattener.flatten(classesDir.toPath());
                 getLog().info("[FLATTEN] Tamamlandi. " +
                     flattener.getRenameMap().size() + " sinif yeniden eslendi.");
             }
+
+            // ── Log pattern injection (obfuscated class adlarını logdan gizle) ──
+            injectLogPatternConfig(classesDir.toPath());
 
             getLog().info("");
             getLog().info("Obfuscation tamamlandi!");
@@ -206,6 +223,42 @@ public class ObfuscatorMojo extends AbstractMojo {
               project.getProperties().getProperty("exec.mainClass", "UNKNOWN_MAIN_CLASS"));
 
         cep.writeMetadata(classesRoot, mc);
+    }
+
+    /**
+     * LogPatternConfig.class'ı plugin JAR'ından alıp target projeye enjekte eder.
+     * Loglarda görünen obfuscated class/paket adlarını (tr.sesasis.app.km gibi) gizler.
+     * Spring Boot auto-configuration kaydını da yazar — manuel adım gerekmez.
+     */
+    private void injectLogPatternConfig(Path classesRoot) throws IOException {
+        String classResourcePath = "/com/obfuscator/runtime/LogPatternConfig.class";
+
+        try (InputStream is = getClass().getResourceAsStream(classResourcePath)) {
+            if (is == null) {
+                getLog().warn("[INJECT] LogPatternConfig.class bulunamadi — atliyor.");
+                return;
+            }
+            Path targetClass = classesRoot
+                .resolve("com/obfuscator/runtime/LogPatternConfig.class");
+            Files.createDirectories(targetClass.getParent());
+            Files.copy(is, targetClass, StandardCopyOption.REPLACE_EXISTING);
+            getLog().info("[INJECT] LogPatternConfig.class enjekte edildi -> " + targetClass);
+        }
+
+        // Spring Boot auto-configuration kaydı
+        Path importsFile = classesRoot.resolve(
+            "META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports");
+        Files.createDirectories(importsFile.getParent());
+
+        String entry = "com.obfuscator.runtime.LogPatternConfig";
+        boolean alreadyRegistered = Files.exists(importsFile) &&
+            Files.readString(importsFile).contains(entry);
+
+        if (!alreadyRegistered) {
+            Files.writeString(importsFile, entry + System.lineSeparator(),
+                StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            getLog().info("[INJECT] AutoConfiguration.imports -> " + entry);
+        }
     }
 
     private boolean isExcluded(Path path) {

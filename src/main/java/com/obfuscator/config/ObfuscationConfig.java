@@ -24,6 +24,14 @@ public class ObfuscationConfig {
      */
     private String flattenTargetPackage = "";
 
+    /**
+     * Taşınan sınıf adları da anlamsızlaştırılsın mı?
+     * true → her sınıf a, b, c, … şeklinde kısa isim alır.
+     * false (default) → orijinal basit ad korunur.
+     * {@link #flattenPackages} = true olduğunda geçerlidir.
+     */
+    private boolean flattenObfuscateNames = false;
+
     public ObfuscationLevel getLevel() {
         return level;
     }
@@ -59,4 +67,7 @@ public class ObfuscationConfig {
 
     public String getFlattenTargetPackage() { return flattenTargetPackage; }
     public void setFlattenTargetPackage(String flattenTargetPackage) { this.flattenTargetPackage = flattenTargetPackage; }
+
+    public boolean isFlattenObfuscateNames() { return flattenObfuscateNames; }
+    public void setFlattenObfuscateNames(boolean flattenObfuscateNames) { this.flattenObfuscateNames = flattenObfuscateNames; }
 }

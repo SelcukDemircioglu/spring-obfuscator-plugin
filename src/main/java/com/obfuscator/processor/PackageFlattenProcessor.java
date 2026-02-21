@@ -44,6 +44,16 @@ public class PackageFlattenProcessor {
     private final Map<String, String> renameMap = new LinkedHashMap<>();
 
     /**
+     * Sınıf adları da anlamsızlaştırılsın mı?
+     * true → her taşınan sınıf a, b, c, … şeklinde kısa bir isim alır.
+     * false → orijinal basit ad korunur (yalnızca paket taşınır).
+     */
+    private final boolean obfuscateNames;
+
+    /** obfuscateNames=true iken sınıf ismi sayacı */
+    private int classNameCounter = 0;
+
+    /**
      * Bu annotasyonlardan herhangi birini taşıyan sınıflar asla taşınmaz:
      *  - @SpringBootApplication  → JAR Start-Class MANIFEST'e yazılır, sabit kalmalı
      *  - @Entity / @MappedSuperclass → Hibernate alan adı = kolon adı, değişemez
@@ -59,11 +69,33 @@ public class PackageFlattenProcessor {
 
     // ───────────────────────────────────────────────────────────────────────
     public PackageFlattenProcessor(Log log, String targetPackage) {
+        this(log, targetPackage, false);
+    }
+
+    public PackageFlattenProcessor(Log log, String targetPackage, boolean obfuscateNames) {
         this.log = log;
         // "tr.sesasis.flat" → "tr/sesasis/flat", boş → ""
         this.targetPackageInternal = (targetPackage == null || targetPackage.isBlank())
             ? ""
             : targetPackage.replace('.', '/').replaceAll("/$", "");
+        this.obfuscateNames = obfuscateNames;
+    }
+
+    /**
+     * Sıralı sayaç tabanlı kısa isim üretir: a, b, …, z, aa, ab, …, az, ba, …
+     *
+     * <p>Yalnızca küçük harf kullanılır — macOS case-insensitive dosya sistemi
+     * nedeniyle 'a' ve 'A' aynı dosyaya yazılır; bu da ClassNotFoundException'a
+     * yol açar. Tüm küçük harf kombinasyonları bu sorunu tamamen önler.
+     */
+    private String nextObfuscatedName() {
+        int n = classNameCounter++;
+        StringBuilder sb = new StringBuilder();
+        do {
+            sb.append((char) ('a' + (n % 26)));
+            n /= 26;
+        } while (n > 0);
+        return sb.reverse().toString();
     }
 
     // ───────────────────────────────────────────────────────────────────────
@@ -74,6 +106,13 @@ public class PackageFlattenProcessor {
      * classesRoot altındaki tüm .class dosyalarını hedef pakete düzleştirir.
      */
     public void flatten(Path classesRoot) throws IOException {
+        // Faz-0: Hedef paketteki eski flatten çıktılarını temizle.
+        //   "mvn clean" kullanılmadan ardışık derlemelerde, önceki flatten çalışmasından
+        //   kalan sınıf dosyaları hedef pakette kalır ve basit ad tahsisini bölmez
+        //   (ör. ContentCategoryDto bir önceki çalışmadan var → yenisi ContentCategoryDto1 olur).
+        //   Temizlik sayesinde Faz-1 her zaman tutarlı bir harita üretir.
+        cleanTargetPackageDir(classesRoot);
+
         // Faz-1: yeniden adlandırma haritasını oluştur
         buildRenameMap(classesRoot);
 
@@ -105,6 +144,40 @@ public class PackageFlattenProcessor {
 
         // Faz-4: boş dizinleri temizle
         removeEmptyDirs(classesRoot);
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Phase 0 — Clean stale classes from previous flatten run
+    // ───────────────────────────────────────────────────────────────────────
+
+    /**
+     * Hedef paketteki tüm .class dosyalarını siler.
+     *
+     * <p>Amaç: "mvn clean" kullanılmadan yapılan ardışık derlemelerde, önceki
+     * flatten çalışmasından kalan eski sınıf dosyaları basit-ad çakışmasına
+     * (ContentCategoryDto → ContentCategoryDto1) ve dolayısıyla runtime
+     * {@code NoSuchMethodError}'a yol açar. Bu metot hedef paketi sıfırlayarak
+     * Faz-1'in her seferinde tutarlı bir yeniden adlandırma haritası üretmesini sağlar.
+     */
+    private void cleanTargetPackageDir(Path classesRoot) throws IOException {
+        if (targetPackageInternal.isEmpty()) return; // kök paket — temizleme
+
+        Path targetDir = classesRoot.resolve(targetPackageInternal);
+        if (!Files.isDirectory(targetDir)) return;
+
+        try (Stream<Path> stream = Files.walk(targetDir)) {
+            long deleted = stream
+                .filter(p -> p.toString().endsWith(".class"))
+                .peek(p -> log.debug("[FLATTEN] Eski sinif siliniyor: " + classesRoot.relativize(p)))
+                .mapToLong(p -> {
+                    try { Files.delete(p); return 1; } catch (IOException ignored) { return 0; }
+                })
+                .sum();
+            if (deleted > 0) {
+                log.info("[FLATTEN] Onceki flatten calismasinden " + deleted
+                    + " eski sinif hedef paketten temizlendi.");
+            }
+        }
     }
 
     // ───────────────────────────────────────────────────────────────────────
@@ -144,9 +217,13 @@ public class PackageFlattenProcessor {
         for (Path p : topLevel) {
             String oldInternal = toInternalName(classesRoot, p);
 
-            // FIXED annotasyonlu sınıfları asla taşıma
-            if (hasFixedAnnotation(p)) {
-                log.debug("[FLATTEN] Sabit sınıf atlandı (MANIFEST/JPA/Config): " + oldInternal);
+            // FIXED annotasyonlu veya enum sınıfları asla taşıma:
+            // - @SpringBootApplication / @Configuration / @Entity → Spring/JPA zorunluluğu
+            // - enum → @Query JPQL string'leri içinde FQDN ile referans edilir;
+            //   ASM ClassRemapper String değerlerini güncellemez, bu yüzden
+            //   taşınan enum'lar JPQL doğrulamasını kırar.
+            if (shouldKeepFixed(p)) {
+                log.debug("[FLATTEN] Sabit sinif atlandi (MANIFEST/JPA/Config/Enum): " + oldInternal);
                 continue;
             }
             String simpleName  = simpleNameOf(oldInternal);
@@ -193,17 +270,33 @@ public class PackageFlattenProcessor {
     }
 
     // ───────────────────────────────────────────────────────────────────────
-    // FIXED annotation tarayıcısı
+    // ───────────────────────────────────────────────────────────────────────
+    // FIXED sınıf kontrolü (annotation + enum — tek geçiş)
     // ───────────────────────────────────────────────────────────────────────
 
     /**
-     * Verilen .class dosyasının sınıf annotasyonlarını tarar.
-     * FIXED_ANNOTATIONS kümesinden herhangi biri varsa {@code true} döner
-     * ve bu sınıf düzleştirmede taşınmaz.
+     * Bir sınıfın düzleştirmeden muaf tutulup tutulmayacağını belirler.
+     *
+     * <p>Muafiyet koşulları:
+     * <ol>
+     *   <li>FIXED_ANNOTATIONS kümesindeki herhangi bir annotasyon taşıyor
+     *       ({@code @SpringBootApplication}, {@code @Entity}, vb.)</li>
+     *   <li>Sınıf bir <b>enum</b> ({@code ACC_ENUM}) — JPQL {@code @Query}
+     *       string'leri enum'ları FQDN ile referans eder; ASM ClassRemapper
+     *       annotation String değerlerini güncellemez, dolayısıyla taşınan
+     *       enum'lar {@code Validation failed for query} hatasına yol açar.</li>
+     * </ol>
      */
-    private boolean hasFixedAnnotation(Path classFile) throws IOException {
+    private boolean shouldKeepFixed(Path classFile) throws IOException {
         byte[] bytes = Files.readAllBytes(classFile);
         ClassReader cr = new ClassReader(bytes);
+
+        // Enum kontrolü: class access flags doğrudan ClassReader'dan okunur
+        if ((cr.getAccess() & Opcodes.ACC_ENUM) != 0) {
+            return true;
+        }
+
+        // Annotation kontrolü
         boolean[] found = {false};
         cr.accept(new ClassVisitor(Opcodes.ASM9) {
             @Override
@@ -211,18 +304,35 @@ public class PackageFlattenProcessor {
                 if (FIXED_ANNOTATIONS.contains(descriptor)) {
                     found[0] = true;
                 }
-                return null; // Alt annotasyonları okumaya gerek yok
+                return null;
             }
         }, ClassReader.SKIP_CODE | ClassReader.SKIP_FRAMES | ClassReader.SKIP_DEBUG);
         return found[0];
     }
 
+    /** @deprecated hasFixedAnnotation yerine shouldKeepFixed kullanın */
+    private boolean hasFixedAnnotation(Path classFile) throws IOException {
+        return shouldKeepFixed(classFile);
+    }
+
     /**
-     * Basit adı çakışmaya göre çözümler.
-     * "MyClass" → kullanılmamışsa "MyClass", kullanılmışsa "MyClass1", "MyClass2", ...
+     * Basit adı çözümler.
+     *
+     * <p>obfuscateNames=false: Orijinal basit ad korunur; çakışmada sayısal son ek eklenir.
+     * <p>obfuscateNames=true : Her sınıf için sayaçtan a/b/c/… şeklinde benzersiz kısa ad üretilir.
      */
     private String resolveSimpleName(String simpleName,
                                       Map<String, Integer> usedSimpleNames) {
+        if (obfuscateNames) {
+            String candidate;
+            do {
+                candidate = nextObfuscatedName();
+            } while (usedSimpleNames.containsKey(candidate));
+            usedSimpleNames.put(candidate, 1);
+            return candidate;
+        }
+
+        // obfuscateNames=false — orijinal ad + çakışma yönetimi
         int count = usedSimpleNames.getOrDefault(simpleName, 0);
         usedSimpleNames.put(simpleName, count + 1);
 

@@ -6,9 +6,7 @@ import com.obfuscator.config.ProtectionLevel;
 import com.obfuscator.config.SpringAnnotationDetector;
 import com.obfuscator.util.BytecodeUtil;
 import org.apache.maven.plugin.logging.Log;
-import org.objectweb.asm.ClassReader;
-import org.objectweb.asm.ClassVisitor;
-import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.*;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -27,6 +25,37 @@ public class ClassProcessor {
         this.level1Obfuscator = new Level1BasicObfuscator();
         this.level2Encryptor = new Level2StringEncryptor();
         this.level3FlowObfuscator = new Level3ControlFlowObfuscator();
+    }
+
+    /**
+     * Creates a ClassVisitor that strips SourceFile and LineNumberTable attributes
+     * WITHOUT touching MethodParameters. SKIP_DEBUG must NOT be used because it also
+     * removes the MethodParameters attribute, which Spring 6 needs for
+     * @RequestParam / @PathVariable parameter name resolution at runtime.
+     */
+    private static ClassVisitor createDebugStrippingVisitor(ClassVisitor cv) {
+        return new ClassVisitor(Opcodes.ASM9, cv) {
+            @Override
+            public void visitSource(String source, String debug) {
+                // drop SourceFile / SourceDebugExtension — prevents decompilers
+                // from showing the original .java filename
+            }
+
+            @Override
+            public MethodVisitor visitMethod(int access, String name, String descriptor,
+                                             String signature, String[] exceptions) {
+                MethodVisitor mv = super.visitMethod(access, name, descriptor, signature, exceptions);
+                return new MethodVisitor(Opcodes.ASM9, mv) {
+                    @Override
+                    public void visitLineNumber(int line, Label start) {
+                        // drop LineNumberTable — prevents decompilers / debuggers
+                        // from mapping bytecode back to source lines.
+                        // visitParameter() is intentionally NOT overridden so that
+                        // the MethodParameters attribute is preserved for Spring.
+                    }
+                };
+            }
+        };
     }
 
     /**
@@ -63,7 +92,9 @@ public class ClassProcessor {
                 }
             }
         };
-        ClassVisitor visitor = writer;
+        // Wrap the writer with our debug-stripping visitor so SourceFile and
+        // LineNumberTable are removed — but MethodParameters is kept intact.
+        ClassVisitor visitor = createDebugStrippingVisitor(writer);
 
         ObfuscationLevel level = config.getLevel();
 
@@ -79,12 +110,14 @@ public class ClassProcessor {
             visitor = level1Obfuscator.createVisitor(visitor);
         }
 
-        // SKIP_DEBUG strips LocalVariableTable, LocalVariableTypeTable, LineNumberTable
-        // and SourceFile attributes — prevents decompilers from reconstructing original names.
-        //
         // Two-pass: pre-register ALL private method renames before processing
         // method bodies so visitMethodInsn remapping works regardless of declaration order.
         // (e.g. <init> that calls a private helper declared later in the class file)
+        //
+        // NOTE: SKIP_DEBUG is intentionally NOT used here. ASM's SKIP_DEBUG flag also
+        // strips the MethodParameters bytecode attribute, which Spring 6 requires to
+        // resolve @RequestParam / @PathVariable names at runtime without explicit value="".
+        // Debug info is stripped instead via createDebugStrippingVisitor() above.
         if (level == ObfuscationLevel.LEVEL_1_BASIC
                 || level == ObfuscationLevel.LEVEL_2_MEDIUM
                 || level == ObfuscationLevel.LEVEL_3_ADVANCED
@@ -92,7 +125,7 @@ public class ClassProcessor {
             level1Obfuscator.preRegisterMethods(reader);
         }
 
-        reader.accept(visitor, ClassReader.EXPAND_FRAMES | ClassReader.SKIP_DEBUG);
+        reader.accept(visitor, ClassReader.EXPAND_FRAMES);
 
         byte[] obfuscatedBytes = writer.toByteArray();
         BytecodeUtil.writeClass(classFile, obfuscatedBytes);
