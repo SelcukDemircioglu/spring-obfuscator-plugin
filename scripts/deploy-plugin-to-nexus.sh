@@ -60,10 +60,19 @@ mvn deploy \
   -q
 
 echo ""
+PLUGIN_VERSION=""
+while IFS= read -r line; do
+  if [[ "$line" == *"<version>"* ]]; then
+    PLUGIN_VERSION="${line#*<version>}"
+    PLUGIN_VERSION="${PLUGIN_VERSION%</version>*}"
+    PLUGIN_VERSION="${PLUGIN_VERSION//[[:space:]]/}"
+    break
+  fi
+done < "$PLUGIN_DIR/pom.xml"
 echo "✅  Plugin başarıyla deploy edildi:"
 echo "    groupId:    com.obfuscator"
 echo "    artifactId: spring-obfuscator-maven-plugin"
-echo "    version:    1.0.5"
+echo "    version:    $PLUGIN_VERSION"
 echo "    repo:       $NEXUS_MAVEN_REPO"
 echo ""
 echo "Dockerfile ve pom.xml için pluginRepository:"

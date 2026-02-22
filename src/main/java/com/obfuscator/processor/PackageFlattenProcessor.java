@@ -54,18 +54,32 @@ public class PackageFlattenProcessor {
     private int classNameCounter = 0;
 
     /**
-     * Bu annotasyonlardan herhangi birini taşıyan sınıflar asla taşınmaz:
-     *  - @SpringBootApplication  → JAR Start-Class MANIFEST'e yazılır, sabit kalmalı
-     *  - @Entity / @MappedSuperclass → Hibernate alan adı = kolon adı, değişemez
-     *  - @Configuration          → Spring proxy'si sınıf adına göre çalışır
+     * Bu annotasyonlardan herhangi birini taşıyan sınıflar flatten ile taşınmaz:
+     *  - @SpringBootApplication  → JAR MANIFEST Start-Class + @ComponentScan başlangıç paketi;
+     *                               sabit kalmalı.
+     *
+     * NOT: @Configuration artık bu listede değil — CGLIB proxy sınıf adını değil
+     *   metot adlarını kullanır; flatten ile taşınabilir ve PARTIAL obfuscation alır.
+     * NOT: @Entity / @MappedSuperclass artık bu listede değil — yeniden adlandırmadan
+     *   önce @Table(name=...) otomatik eklenir.
      */
     private static final Set<String> FIXED_ANNOTATIONS = new HashSet<>(Arrays.asList(
         "Lorg/springframework/boot/autoconfigure/SpringBootApplication;",
+        // @Configuration classes use CGLIB proxying at runtime (proxyBeanMethods=true default).
+        // Moving them to a flat package with a random name breaks CGLIB subclass creation
+        // and @Bean method interception, so the beans (e.g. auditorAware) never get registered.
+        // Keep these classes in-place (original package/name); FULL protection still applies
+        // so their internal field/method names are not obfuscated.
         "Lorg/springframework/context/annotation/Configuration;",
-        "Ljakarta/persistence/Entity;",
-        "Ljakarta/persistence/Table;",
-        "Ljakarta/persistence/MappedSuperclass;"
+        "Lorg/springframework/context/annotation/Bean;"
     ));
+
+    private static final String JAKARTA_ENTITY    = "Ljakarta/persistence/Entity;";
+    private static final String JAVAX_ENTITY      = "Ljavax/persistence/Entity;";
+    private static final String JAKARTA_MAPPED_SC = "Ljakarta/persistence/MappedSuperclass;";
+    private static final String JAVAX_MAPPED_SC   = "Ljavax/persistence/MappedSuperclass;";
+    private static final String JAKARTA_TABLE      = "Ljakarta/persistence/Table;";
+    private static final String JAVAX_TABLE        = "Ljavax/persistence/Table;";
 
     // ───────────────────────────────────────────────────────────────────────
     public PackageFlattenProcessor(Log log, String targetPackage) {
@@ -120,6 +134,11 @@ public class PackageFlattenProcessor {
             log.info("[FLATTEN] Taşınacak sınıf bulunamadı, atlanıyor.");
             return;
         }
+
+        // Faz-1.5: @Entity / @MappedSuperclass sınıfları yeniden adlandırılmadan önce
+        // @Table(name="...") enjekte et; aksi hâlde Hibernate tablo adını sınıf adından
+        // türetir ve yeniden adlandırma sonrası tablo bulunamaz hatası oluşur.
+        injectTableAnnotationsForRenamedEntities(classesRoot);
 
         log.info("[FLATTEN] " + renameMap.size() + " sınıf → "
             + (targetPackageInternal.isEmpty()
@@ -291,12 +310,18 @@ public class PackageFlattenProcessor {
         byte[] bytes = Files.readAllBytes(classFile);
         ClassReader cr = new ClassReader(bytes);
 
-        // Enum kontrolü: class access flags doğrudan ClassReader'dan okunur
+        // Enum'lar orijinal paketlerinde sabit tutulur.
+        // JPQL @Query string'lerinde enum FQCN ile referans olabilir
+        // (örn. "WHERE e.status != tr.sesasis.kara.enums.TrainStatus.COMPLETE").
+        // ASM ClassRemapper JPQL string sabitleri içindeki isim referanslarını
+        // güncelleyemez; bu yüzden enum'lar flatten edilmez.
         if ((cr.getAccess() & Opcodes.ACC_ENUM) != 0) {
+            log.debug("[FLATTEN] Enum orijinal pakette sabit tutuluyor (JPQL FQCN korunması): "
+                + classFile.getFileName());
             return true;
         }
 
-        // Annotation kontrolü
+        // Annotation kontrolü — sadece @SpringBootApplication sabit kalır
         boolean[] found = {false};
         cr.accept(new ClassVisitor(Opcodes.ASM9) {
             @Override
@@ -313,6 +338,198 @@ public class PackageFlattenProcessor {
     /** @deprecated hasFixedAnnotation yerine shouldKeepFixed kullanın */
     private boolean hasFixedAnnotation(Path classFile) throws IOException {
         return shouldKeepFixed(classFile);
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Phase 1.5 — @Table(name=...) injection for renamed @Entity classes
+    // ───────────────────────────────────────────────────────────────────────
+
+    /**
+     * renameMap'te bulunan @Entity / @MappedSuperclass sınıflarına
+     * @Table(name="snake_case_original_name") ekler (sadece açık tablo adı yoksa).
+     * Dış sınıf-merkezli: inner class'lar ($) atlanır.
+     */
+    private void injectTableAnnotationsForRenamedEntities(Path classesRoot) throws IOException {
+        for (String oldInternal : new ArrayList<>(renameMap.keySet())) {
+            if (oldInternal.contains("$")) continue; // inner class — dış sınıf yönetir
+
+            Path classFile = classesRoot.resolve(
+                    oldInternal.replace('/', File.separatorChar) + ".class");
+            if (!Files.exists(classFile)) continue;
+
+            byte[] bytes = Files.readAllBytes(classFile);
+            // Sadece @Entity sınıflarına işlem yapılır.
+            // @MappedSuperclass sınıfları tablo sahibi değildir ve @Table taşıyamaz.
+            if (!isEntity(bytes)) continue;
+
+            String simpleName = simpleNameOf(oldInternal);
+            byte[] modified   = bytes;
+
+            // Her @Entity sınıfına @Entity(name="OriginalSimpleName") enjekte et.
+            // Sınıf rename/move edilince Hibernate yeni class adını entity adı olarak kullanır.
+            // @Entity(name="Token") ekleyerek JPQL "FROM Token" ve Spring Data derived query'ler çalışır.
+            modified = injectOrUpdateEntityName(modified, simpleName);
+
+            // @Table(name=...) yoksa snake_case tablo adını ekle
+            String existingName = getExplicitTableName(modified);
+            if (existingName == null || existingName.isBlank()) {
+                String tableName = camelToSnake(simpleName);
+                modified = injectOrReplaceTableAnnotation(modified, tableName);
+                log.info("[FLATTEN] @Table(name=\"" + tableName + "\") + @Entity(name=\"" + simpleName + "\") eklendi: " + oldInternal);
+            } else {
+                log.debug("[FLATTEN] @Table mevcut, @Entity(name=\"" + simpleName + "\") eklendi: " + oldInternal);
+            }
+
+            Files.write(classFile, modified);
+        }
+    }
+
+    /** CamelCase → snake_case: AdvertType → advert_type */
+    private static String camelToSnake(String name) {
+        return name
+            .replaceAll("([A-Z]+)([A-Z][a-z])", "$1_$2")
+            .replaceAll("([a-z\\d])([A-Z])", "$1_$2")
+            .toLowerCase()
+            .replaceAll("^_", "");
+    }
+
+    /** Sınıfın SADECE @Entity annotasyonu taşıyıp taşımadığını döndürür (@MappedSuperclass hariç). */
+    private boolean isEntity(byte[] bytes) {
+        boolean[] found = {false};
+        new ClassReader(bytes).accept(new ClassVisitor(Opcodes.ASM9) {
+            @Override
+            public AnnotationVisitor visitAnnotation(String descriptor, boolean visible) {
+                if (JAKARTA_ENTITY.equals(descriptor) || JAVAX_ENTITY.equals(descriptor)) {
+                    found[0] = true;
+                }
+                return null;
+            }
+        }, ClassReader.SKIP_CODE | ClassReader.SKIP_FRAMES | ClassReader.SKIP_DEBUG);
+        return found[0];
+    }
+
+    /** Sınıfın @Entity veya @MappedSuperclass annotasyonu taşıyıp taşımadığını döndürür. */
+    private boolean isEntityOrMappedSuperclass(byte[] bytes) {
+        boolean[] found = {false};
+        new ClassReader(bytes).accept(new ClassVisitor(Opcodes.ASM9) {
+            @Override
+            public AnnotationVisitor visitAnnotation(String descriptor, boolean visible) {
+                if (JAKARTA_ENTITY.equals(descriptor) || JAVAX_ENTITY.equals(descriptor)
+                        || JAKARTA_MAPPED_SC.equals(descriptor) || JAVAX_MAPPED_SC.equals(descriptor)) {
+                    found[0] = true;
+                }
+                return null;
+            }
+        }, ClassReader.SKIP_CODE | ClassReader.SKIP_FRAMES | ClassReader.SKIP_DEBUG);
+        return found[0];
+    }
+
+    /**
+     * Mevcut @Table(name=...) değerini döndürür.
+     * @Table yoksa null; @Table var ama name="" ise boş string.
+     */
+    private String getExplicitTableName(byte[] bytes) {
+        String[] result = {null};
+        new ClassReader(bytes).accept(new ClassVisitor(Opcodes.ASM9) {
+            @Override
+            public AnnotationVisitor visitAnnotation(String descriptor, boolean visible) {
+                if (JAKARTA_TABLE.equals(descriptor) || JAVAX_TABLE.equals(descriptor)) {
+                    result[0] = ""; // @Table var ama henüz name yok
+                    return new AnnotationVisitor(Opcodes.ASM9) {
+                        @Override
+                        public void visit(String attrName, Object value) {
+                            if ("name".equals(attrName) && value != null) {
+                                result[0] = value.toString();
+                            }
+                        }
+                    };
+                }
+                return null;
+            }
+        }, ClassReader.SKIP_CODE | ClassReader.SKIP_FRAMES | ClassReader.SKIP_DEBUG);
+        return result[0];
+    }
+
+    /**
+     * @Entity(name="entityName") ekler/günceller.
+     * JPQL sorgularda entity adı Java class adıyla aynı olur.
+     * Sınıf rename edilirse Hibernate'in entity adı da değişir → FROM Token çalışmaz.
+     * Bu metod @Entity(name="OriginalSimpleName") ekleyerek Hibernate entity adını korur.
+     */
+    private byte[] injectOrUpdateEntityName(byte[] classBytes, String entityName) {
+        ClassReader cr = new ClassReader(classBytes);
+        ClassWriter cw = new ClassWriter(0);
+
+        cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+            @Override
+            public AnnotationVisitor visitAnnotation(String descriptor, boolean visible) {
+                // Mevcut @Entity'i değiştir — name attr'üyle yenisini yaz
+                if (JAKARTA_ENTITY.equals(descriptor) || JAVAX_ENTITY.equals(descriptor)) {
+                    AnnotationVisitor original = super.visitAnnotation(descriptor, visible);
+                    return new AnnotationVisitor(Opcodes.ASM9, original) {
+                        boolean nameWritten = false;
+
+                        @Override
+                        public void visit(String attrName, Object value) {
+                            if ("name".equals(attrName)) {
+                                // name zaten varsa koru
+                                nameWritten = true;
+                                super.visit(attrName, value);
+                            } else {
+                                super.visit(attrName, value);
+                            }
+                        }
+
+                        @Override
+                        public void visitEnd() {
+                            if (!nameWritten) {
+                                // name yoksa ekle
+                                super.visit("name", entityName);
+                            }
+                            super.visitEnd();
+                        }
+                    };
+                }
+                return super.visitAnnotation(descriptor, visible);
+            }
+        }, 0);
+
+        return cw.toByteArray();
+    }
+
+    /**
+     * Sınıf bytecode'una @Table(name=tableName) enjekte eder.
+     * Mevcut @Table varsa (name'siz) onu da kaldırır, yenisini ekler.
+     */
+    private byte[] injectOrReplaceTableAnnotation(byte[] classBytes, String tableName) {
+        ClassReader cr = new ClassReader(classBytes);
+        ClassWriter cw = new ClassWriter(0);
+
+        cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+            boolean tableWritten = false;
+
+            @Override
+            public AnnotationVisitor visitAnnotation(String descriptor, boolean visible) {
+                // Mevcut @Table'ı düşür — aşağıda yenisini ekleyeceğiz
+                if (JAKARTA_TABLE.equals(descriptor) || JAVAX_TABLE.equals(descriptor)) {
+                    return null;
+                }
+                return super.visitAnnotation(descriptor, visible);
+            }
+
+            @Override
+            public void visitEnd() {
+                if (!tableWritten) {
+                    tableWritten = true;
+                    AnnotationVisitor av = cw.visitAnnotation("Ljakarta/persistence/Table;", true);
+                    av.visit("name", tableName);
+                    av.visitEnd();
+                }
+                super.visitEnd();
+            }
+        }, 0);
+
+        return cw.toByteArray();
     }
 
     /**

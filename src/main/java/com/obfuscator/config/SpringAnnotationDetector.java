@@ -32,12 +32,21 @@ public class SpringAnnotationDetector extends ClassVisitor {
 
     static {
         // ── FULL protection ────────────────────────────────────────────────────
-        // JPA: field names map directly to DB columns; renaming breaks Hibernate.
+        // Spring Boot entry point — MANIFEST Start-Class + @ComponentScan base.
+        FULL_PROTECTION.add("Lorg/springframework/boot/autoconfigure/SpringBootApplication;");
+        // JPA entities: private field names = DB column names (without @Column).
+        // Content obfuscation would rename fields → Hibernate can't find columns.
+        // These classes ARE moved by flatten (with @Table injection); content stays intact.
         FULL_PROTECTION.add("Ljakarta/persistence/Entity;");
         FULL_PROTECTION.add("Ljakarta/persistence/Table;");
         FULL_PROTECTION.add("Ljakarta/persistence/MappedSuperclass;");
-        // Spring Boot entry point and configuration classes.
-        FULL_PROTECTION.add("Lorg/springframework/boot/autoconfigure/SpringBootApplication;");
+        FULL_PROTECTION.add("Ljavax/persistence/Entity;");
+        FULL_PROTECTION.add("Ljavax/persistence/MappedSuperclass;");
+        // @Configuration: CGLIB subclass proxying depends on field/method bytecode
+        // layout (e.g. @Autowired fields, @Bean method names referenced by CGLIB).
+        // Renaming private fields breaks field-injection and lambdas capturing them.
+        // Class is still MOVED by flatten (FIXED_ANNOTATIONS removed @Configuration);
+        // only *content* obfuscation is skipped.
         FULL_PROTECTION.add("Lorg/springframework/context/annotation/Configuration;");
         FULL_PROTECTION.add("Lorg/springframework/context/annotation/Bean;");
 

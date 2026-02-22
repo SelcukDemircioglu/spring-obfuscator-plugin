@@ -8,6 +8,12 @@ public class ObfuscationConfig {
     private String[] excludePackages;
     /** Optional 64-char hex AES-256 key. If null, a random key is generated. */
     private String encryptionKey;
+
+    /**
+     * LEVEL_2 string şifreleme için AES anahtarı (tam olarak 16 karakter).
+     * Belirtilmezse varsayılan sabit anahtar kullanılır.
+     */
+    private String stringEncryptionKey;
     /** Binary name of the @SpringBootApplication main class for LEVEL_4. */
     private String mainClass;
 
@@ -70,4 +76,7 @@ public class ObfuscationConfig {
 
     public boolean isFlattenObfuscateNames() { return flattenObfuscateNames; }
     public void setFlattenObfuscateNames(boolean flattenObfuscateNames) { this.flattenObfuscateNames = flattenObfuscateNames; }
+
+    public String getStringEncryptionKey() { return stringEncryptionKey; }
+    public void setStringEncryptionKey(String stringEncryptionKey) { this.stringEncryptionKey = stringEncryptionKey; }
 }

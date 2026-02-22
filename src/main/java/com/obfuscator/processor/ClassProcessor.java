@@ -23,7 +23,10 @@ public class ClassProcessor {
         this.config = config;
         this.log = log;
         this.level1Obfuscator = new Level1BasicObfuscator();
-        this.level2Encryptor = new Level2StringEncryptor();
+        String strKey = config.getStringEncryptionKey();
+        this.level2Encryptor = (strKey != null && !strKey.isBlank())
+            ? new Level2StringEncryptor(strKey)
+            : new Level2StringEncryptor();
         this.level3FlowObfuscator = new Level3ControlFlowObfuscator();
     }
 
