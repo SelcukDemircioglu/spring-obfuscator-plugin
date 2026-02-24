@@ -184,6 +184,27 @@ public class ObfuscatorMojo extends AbstractMojo {
         ClassProcessor processor = new ClassProcessor(config, getLog());
 
         try {
+            // ── Phase 0: Global pre-registration of private field & method renames ──
+            // Level1BasicObfuscator registers field/method renames lazily when each class
+            // is visited (visitField / visitMethodDeclaration). If an inner class (e.g.
+            // mg$DevicePollTask) is processed before its outer class (mg), the outer
+            // class's field renames are not yet in the NameGenerator when the inner
+            // class's GETFIELD instructions are rewritten → the inner class keeps the
+            // original field name → NoSuchFieldError at runtime.
+            //
+            // Fix: scan ALL class files first to register every private field and method
+            // rename, then do the actual transformation pass (Phase 1).
+            {
+                List<Path> allClassPaths;
+                try (Stream<Path> ps = Files.walk(classesDir.toPath())) {
+                    allClassPaths = ps
+                        .filter(p -> p.toString().endsWith(".class"))
+                        .filter(p -> !isExcluded(p))
+                        .collect(java.util.stream.Collectors.toList());
+                }
+                processor.preRegisterAllClasses(allClassPaths);
+            }
+
             // ── Phase 1: LEVEL_3 obfuscation (alan/metot renaming + string şifreleme + control flow) ──
             List<Path> partialClasses = processDirectory(classesDir.toPath(), processor);
 

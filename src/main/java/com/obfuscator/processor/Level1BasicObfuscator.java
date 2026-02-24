@@ -8,6 +8,76 @@ public class Level1BasicObfuscator {
     private final NameGenerator nameGenerator = new NameGenerator();
 
     /**
+     * Global pre-scan pass: walks only field declarations and registers the
+     * obfuscated name for every private non-synthetic field.
+     *
+     * Must be called for ALL classes before any class is processed. This prevents
+     * NoSuchFieldError when an inner class (e.g. mg$DevicePollTask) is processed
+     * before its outer class (mg) — the inner class emits GETFIELD mg.fieldName
+     * and needs the rename mapping to already exist in the NameGenerator.
+     *
+     * Outer class files sort alphabetically AFTER inner class files because
+     * '.' (44) > '$' (36), so without this pre-pass the outer class field rename
+     * would not yet be registered when the inner class is transformed.
+     */
+    public void preRegisterFields(ClassReader reader) {
+        reader.accept(new ClassVisitor(Opcodes.ASM9) {
+            private String className;
+            // If the class itself carries a Jackson annotation (e.g. @JsonInclude)
+            // we must NOT obfuscate any of its fields, because Jackson will access
+            // them by the field name (directly or via merged property introspection)
+            // and the obfuscated name would leak into the JSON response.
+            private boolean classHasJacksonAnnotation = false;
+
+            @Override
+            public void visit(int version, int access, String name, String signature,
+                             String superName, String[] interfaces) {
+                this.className = name;
+            }
+
+            @Override
+            public AnnotationVisitor visitAnnotation(String descriptor, boolean visible) {
+                // Class-level Jackson annotation → protect ALL fields of this class
+                if (descriptor.startsWith("Lcom/fasterxml/jackson/")) {
+                    classHasJacksonAnnotation = true;
+                }
+                return null;
+            }
+
+            @Override
+            public FieldVisitor visitField(int access, String name, String descriptor,
+                                          String signature, Object value) {
+                boolean isPrivate   = (access & Opcodes.ACC_PRIVATE)   != 0;
+                boolean isSynthetic = (access & Opcodes.ACC_SYNTHETIC)  != 0;
+                // Skip outer-class capture fields ("this$0", "this$1", ...)
+                if (!isPrivate || isSynthetic || name.startsWith("this$")) return null;
+                // If the class is Jackson-annotated, never obfuscate its fields
+                if (classHasJacksonAnnotation) return null;
+                final String fieldKey = className + "." + name;
+                // Return a real FieldVisitor so we can inspect field-level annotations
+                // before deciding whether to register an obfuscated name
+                return new FieldVisitor(Opcodes.ASM9) {
+                    boolean fieldHasJacksonAnnotation = false;
+                    @Override
+                    public AnnotationVisitor visitAnnotation(String desc, boolean visible) {
+                        if (desc.startsWith("Lcom/fasterxml/jackson/")) {
+                            fieldHasJacksonAnnotation = true;
+                        }
+                        return null;
+                    }
+                    @Override
+                    public void visitEnd() {
+                        // Only register rename if field has no Jackson annotation
+                        if (!fieldHasJacksonAnnotation) {
+                            nameGenerator.generateObfuscatedName(fieldKey, "f");
+                        }
+                    }
+                };
+            }
+        }, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+    }
+
+    /**
      * Pre-scan pass: walks only method declarations (SKIP_CODE) and registers
      * the obfuscated name for every private non-special method so that call-site
      * remapping in visitMethodInsn works correctly regardless of declaration order.
@@ -55,9 +125,15 @@ public class Level1BasicObfuscator {
             public FieldVisitor visitField(int access, String name, String descriptor,
                                           String signature, Object value) {
                 if ((access & Opcodes.ACC_PRIVATE) != 0 && !name.startsWith("this$")) {
-                    String obfuscatedName = nameGenerator.generateObfuscatedName(
-                        className + "." + name, "f");
-                    return super.visitField(access, obfuscatedName, descriptor, signature, value);
+                    // Use only pre-registered mappings (from preRegisterFields).
+                    // Fields skipped during pre-registration (Jackson-annotated fields
+                    // or fields in Jackson-annotated classes) return null here, so
+                    // their original names are preserved — preventing obfuscated names
+                    // from leaking into JSON serialization / deserialization.
+                    String obfuscatedName = nameGenerator.getMappedName(className + "." + name);
+                    if (obfuscatedName != null) {
+                        return super.visitField(access, obfuscatedName, descriptor, signature, value);
+                    }
                 }
                 return super.visitField(access, name, descriptor, signature, value);
             }

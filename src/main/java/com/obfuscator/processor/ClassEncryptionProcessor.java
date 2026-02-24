@@ -419,6 +419,13 @@ public class ClassEncryptionProcessor {
             case "Lorg/springframework/stereotype/Controller;":
             case "Lorg/springframework/web/bind/annotation/RestController;":
             case "Lorg/springframework/web/bind/annotation/RequestMapping;":
+            // @ControllerAdvice and @RestControllerAdvice are @Component meta-annotated.
+            // Without these, @RestControllerAdvice classes (e.g. GlobalExceptionHandler)
+            // are not written to spring.components → Spring Boot can't find them as beans
+            // → @ExceptionHandler methods not registered → exceptions propagate to /error
+            // → Spring Security blocks /error → client gets 403 instead of the real error code.
+            case "Lorg/springframework/web/bind/annotation/ControllerAdvice;":
+            case "Lorg/springframework/web/bind/annotation/RestControllerAdvice;":
             // @Configuration IS a @Component meta-annotation — must use Component stereotype
             // so Spring's CandidateComponentsIndex.getCandidates("...Component") finds it
             case "Lorg/springframework/context/annotation/Configuration;":

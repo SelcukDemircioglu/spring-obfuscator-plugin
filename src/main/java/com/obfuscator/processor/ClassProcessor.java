@@ -10,6 +10,7 @@ import org.objectweb.asm.*;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.List;
 
 public class ClassProcessor {
 
@@ -28,6 +29,30 @@ public class ClassProcessor {
             ? new Level2StringEncryptor(strKey)
             : new Level2StringEncryptor();
         this.level3FlowObfuscator = new Level3ControlFlowObfuscator();
+    }
+
+    /**
+     * Global pre-scan: registers obfuscated names for private fields and private
+     * methods in ALL classes BEFORE any class body is transformed.
+     *
+     * This must be called once (with the full class list) before processClass() is
+     * invoked on any file.  Without it, processing an inner class (e.g. mg$DevicePollTask)
+     * before its outer class (mg) leaves the inner class's GETFIELD references
+     * unrewritten, causing NoSuchFieldError at runtime.
+     */
+    public void preRegisterAllClasses(List<Path> classFiles) throws IOException {
+        ObfuscationLevel level = config.getLevel();
+        boolean needsLevel1 = level == ObfuscationLevel.LEVEL_1_BASIC
+                || level == ObfuscationLevel.LEVEL_2_MEDIUM
+                || level == ObfuscationLevel.LEVEL_3_ADVANCED
+                || level == ObfuscationLevel.LEVEL_4_ENCRYPTED;
+        if (!needsLevel1) return;
+
+        for (Path classFile : classFiles) {
+            ClassReader reader = BytecodeUtil.readClass(classFile);
+            level1Obfuscator.preRegisterFields(reader);
+            level1Obfuscator.preRegisterMethods(reader);
+        }
     }
 
     /**
