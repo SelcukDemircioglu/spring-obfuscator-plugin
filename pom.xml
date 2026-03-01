@@ -97,7 +97,30 @@
             <version>2.1.1</version>
             <scope>provided</scope>
         </dependency>
+
+        <!--
+            Gradle API (provided): used to compile the Gradle plugin classes
+            (ObfuscatorGradlePlugin, ObfuscatorGradleTask, ObfuscatorGradleExtension).
+            Not bundled in the final JAR — the consumer's Gradle runtime provides it.
+            Version 7.6 matches AGP 7.4.2 (sesasis-native-library) which requires Gradle 7.5+.
+        -->
+        <dependency>
+            <groupId>dev.gradleplugins</groupId>
+            <artifactId>gradle-api</artifactId>
+            <version>7.6</version>
+            <scope>provided</scope>
+        </dependency>
     </dependencies>
+
+    <repositories>
+        <repository>
+            <id>gradle-plugin-dev</id>
+            <name>Gradle Plugin Dev Repository</name>
+            <url>https://dl.gradleplugins.dev/releases</url>
+            <releases><enabled>true</enabled></releases>
+            <snapshots><enabled>false</enabled></snapshots>
+        </repository>
+    </repositories>
 
     <build>
         <plugins>
