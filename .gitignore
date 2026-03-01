@@ -4,6 +4,7 @@ target/
 !**/src/main/**/target/
 !**/src/test/**/target/
 sesasis-test
+sesasis-native-test
 ### STS ###
 .apt_generated
 .classpath
